@@ -15,10 +15,10 @@ os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 # 训练参数
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # 优先用GPU
 BATCH_SIZE = 2
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 1e-4
 EPOCHS = 300
 LATENT_DIM = 256
-KL_TARGET_WEIGHT = 0.00001
+KL_TARGET_WEIGHT = 0.1  # 修正1：提高KL目标权重（量级对齐后）
 SEED = 42
 
 # 固定随机种子（保证结果可复现）
@@ -26,6 +26,8 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(SEED)
+    torch.backends.cudnn.deterministic = True  # 新增：固定cudnn，避免数值波动
+    torch.backends.cudnn.benchmark = False
 
 
 # -------------------------- 数据集定义 --------------------------
@@ -34,6 +36,9 @@ class BraTSDataset(Dataset):
 
     def __init__(self, data_dir):
         self.data_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".npy")]
+        # 新增：检查数据集是否为空
+        if len(self.data_paths) == 0:
+            raise ValueError(f"未找到.npy文件，请检查路径：{data_dir}")
 
     def __len__(self):
         return len(self.data_paths)
@@ -43,14 +48,17 @@ class BraTSDataset(Dataset):
         data = np.load(self.data_paths[idx], allow_pickle=True).item()
         modalities = data["modalities"]  # 预期形状: (4, 128, 160, 160)
 
-        # 转换为torch张量并返回，不再需要手动 padding
+        # 转换为torch张量（预处理已归一化，此处无需重复操作）
         modalities_tensor = torch.from_numpy(modalities).float()
+        # 新增：防止归一化后仍有极端值（比如nan/inf）
+        modalities_tensor = torch.clamp(modalities_tensor, 0.0, 1.0)
         return modalities_tensor
 
 
 # -------------------------- 3D VAE模型定义 --------------------------
 class ResBlock3D(nn.Module):
     """3D残差块：防止梯度消失，保留空间细节"""
+
     def __init__(self, channels):
         super().__init__()
         self.conv = nn.Sequential(
@@ -77,11 +85,14 @@ class Encoder3D(nn.Module):
         self.res2 = ResBlock3D(128)
         self.down3 = nn.Sequential(nn.Conv3d(128, 256, 3, stride=2, padding=1), nn.BatchNorm3d(256), nn.ReLU())
         self.res3 = ResBlock3D(256)
-        self.down4 = nn.Sequential(nn.Conv3d(256, 256, 3, stride=2, padding=1),nn.BatchNorm3d(256),nn.ReLU())
+        self.down4 = nn.Sequential(nn.Conv3d(256, 256, 3, stride=2, padding=1), nn.BatchNorm3d(256), nn.ReLU())
         self.res4 = ResBlock3D(256)
 
         self.fc_mu = nn.Linear(256 * 8 * 10 * 10, latent_dim)
         self.fc_logvar = nn.Linear(256 * 8 * 10 * 10, latent_dim)
+
+        # 新增：约束logvar范围，防止exp溢出
+        self.logvar_clamp = lambda x: torch.clamp(x, min=-10.0, max=10.0)
 
     def forward(self, x):
         x = self.init_conv(x)
@@ -90,7 +101,9 @@ class Encoder3D(nn.Module):
         x = self.res3(self.down3(x))
         x = self.res4(self.down4(x))
         x = x.view(x.size(0), -1)
-        return self.fc_mu(x), self.fc_logvar(x)
+        mu = self.fc_mu(x)
+        logvar = self.logvar_clamp(self.fc_logvar(x))  # 约束logvar范围
+        return mu, logvar
 
 
 class Decoder3D(nn.Module):
@@ -102,13 +115,22 @@ class Decoder3D(nn.Module):
         self.up4 = nn.Sequential(nn.ConvTranspose3d(256, 256, 3, stride=2, padding=1, output_padding=1),nn.BatchNorm3d(256), nn.ReLU())
         self.res4 = ResBlock3D(256)  # 新增残差块
         # 第3次上采样：256→128，维度16×20×20→32×40×40
-        self.up3 = nn.Sequential(nn.ConvTranspose3d(256, 128, 3, stride=2, padding=1, output_padding=1),nn.BatchNorm3d(128), nn.ReLU())
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose3d(256, 128, 3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm3d(128), nn.ReLU()
+        )
         self.res3 = ResBlock3D(128)
         # 第2次上采样：128→64，维度32×40×40→64×80×80
-        self.up2 = nn.Sequential(nn.ConvTranspose3d(128, 64, 3, stride=2, padding=1, output_padding=1),nn.BatchNorm3d(64), nn.ReLU())
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose3d(128, 64, 3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm3d(64), nn.ReLU()
+        )
         self.res2 = ResBlock3D(64)
         # 第1次上采样：64→32，维度64×80×80→128×160×160
-        self.up1 = nn.Sequential(nn.ConvTranspose3d(64, 32, 3, stride=2, padding=1, output_padding=1),nn.BatchNorm3d(32), nn.ReLU())
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose3d(64, 32, 3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm3d(32), nn.ReLU()
+        )
         self.res1 = ResBlock3D(32)
 
         # 最终层：32→4，恢复4个模态，尺寸已完美匹配128×160×160
@@ -121,6 +143,7 @@ class Decoder3D(nn.Module):
         x = self.res2(self.up2(x))
         x = self.res1(self.up1(x))
         return torch.sigmoid(self.final_conv(x))
+
 
 class VAE3D(nn.Module):
     """完整的3D VAE模型"""
@@ -145,16 +168,28 @@ class VAE3D(nn.Module):
 
 # -------------------------- 损失函数定义 --------------------------
 def vae_loss(recon_x, x, mu, logvar, kl_weight):
+    """
+    修正版VAE损失：
+    1. 重建损失：按总像素数求平均（量级≈0.01~0.1）
+    2. KL损失：按每个样本的latent_dim求平均，再按批次平均（量级≈0.1~1.0）
+    3. 新增数值稳定处理
+    """
+    # 1. 重建损失：对所有像素取平均（等价于sum/x.numel()）
     recon_loss = nn.MSELoss(reduction='mean')(recon_x, x)
 
-    # KL 散度也采取平均模式：对维度求和，对 batch 取平均
-    kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+    # 2. KL损失：数值稳定版 + 按维度平均
+    # 步骤1：逐元素计算KL项，防止整体溢出
+    kl_element = 1 + logvar - mu.pow(2) - logvar.exp()
+    # 步骤2：限制KL元素范围，避免极端值
+    kl_element = torch.clamp(kl_element, min=-1e6, max=1e6)
+    # 步骤3：按每个样本的latent_dim求平均，再按批次平均
+    kl_per_sample = -0.5 * torch.mean(kl_element, dim=1)
+    kl_loss = torch.mean(kl_per_sample)
 
-    # 因为 recon_loss 变小了，我们需要给 KL 一个更小的权重（比如 1e-5 或 1e-6）
-    # 否则模型还是会模糊。这里先用传入的 kl_weight
+    # 3. 总损失
     total_loss = recon_loss + kl_weight * kl_loss
-
     return total_loss, recon_loss, kl_loss
+
 
 # -------------------------- 训练流程 --------------------------
 def train_vae():
@@ -165,7 +200,7 @@ def train_vae():
 
     # 2. 初始化模型、优化器
     model = VAE3D(LATENT_DIM).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, eps=1e-5)  # 新增eps，提高优化稳定性
 
     # 3. 早停策略（避免过拟合）
     best_recon_loss = float("inf")
@@ -183,7 +218,10 @@ def train_vae():
         epoch_total_loss = 0.0
         epoch_recon_loss = 0.0
         epoch_kl_loss = 0.0
-        current_kl_weight = min(KL_TARGET_WEIGHT, KL_TARGET_WEIGHT * (epoch / 50))
+
+        # 修正2：KL权重暖启动（前50轮线性增长到0.1，避免初始权重为0）
+        kl_warmup_epochs = 50
+        current_kl_weight = KL_TARGET_WEIGHT * min(1.0, (epoch + 1) / kl_warmup_epochs)
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
         for batch in pbar:
@@ -193,9 +231,10 @@ def train_vae():
             recon_batch, mu, logvar = model(batch)
             total_loss, recon_loss, kl_loss = vae_loss(recon_batch, batch, mu, logvar, current_kl_weight)
 
-            # 反向传播
+            # 反向传播：新增梯度裁剪，防止梯度爆炸
             optimizer.zero_grad()
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪到最大范数1.0
             optimizer.step()
 
             # 累计损失
@@ -203,7 +242,7 @@ def train_vae():
             epoch_recon_loss += recon_loss.item()
             epoch_kl_loss += kl_loss.item()
 
-            # 更新进度条
+            # 更新进度条（保留4位小数，避免科学计数法）
             pbar.set_postfix({
                 "total_loss": f"{total_loss.item():.4f}",
                 "recon_loss": f"{recon_loss.item():.4f}",
@@ -281,7 +320,7 @@ def generate_samples(model_path):
 
     # 2. 加载一个真实样本作为参考
     dataset = BraTSDataset(PROCESSED_DATA_DIR)
-    real_sample = dataset[0].unsqueeze(0).to(DEVICE)
+    real_sample = dataset[0].unsqueeze(0).to(DEVICE)  # (1, 4, 128, 160, 160)
 
     # 3. 生成重建样本
     with torch.no_grad():
@@ -290,9 +329,9 @@ def generate_samples(model_path):
         random_z = torch.randn(1, LATENT_DIM).to(DEVICE)
         gen_sample = model.decoder(random_z)
 
-    # 4. 转换为numpy数组，可视化（取第80层）
+    # 4. 转换为numpy数组，可视化（取第64层）
     slice_idx = 64
-    real_np = real_sample.cpu().numpy()[0]
+    real_np = real_sample.cpu().numpy()[0]  # (4, 128, 160, 160)
     recon_np = recon_sample.cpu().numpy()[0]
     gen_np = gen_sample.cpu().numpy()[0]
 
