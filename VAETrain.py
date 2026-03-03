@@ -195,91 +195,114 @@ def vae_loss(recon_x, x, mu, logvar, kl_weight):
 def train_vae():
     # 1. 加载数据集
     dataset = BraTSDataset(PROCESSED_DATA_DIR)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)  # Windows下num_workers=0
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     print(f"训练集样本数：{len(dataset)}，批次大小：{BATCH_SIZE}，总批次数：{len(dataloader)}")
 
     # 2. 初始化模型、优化器
     model = VAE3D(LATENT_DIM).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, eps=1e-5)  # 新增eps，提高优化稳定性
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, eps=1e-5)
+    grad_clip_norm = 1.0
 
-    # 3. 早停策略（避免过拟合）
-    best_recon_loss = float("inf")
-    patience = 10  # 连续10轮无提升则停止
+    # 3. 续训关键：定义检查点路径（保存最新训练状态）
+    checkpoint_path = os.path.join(MODEL_SAVE_DIR, "latest_ckpt.pth")
+    best_model_path = os.path.join(MODEL_SAVE_DIR, "best_vae3d.pth")
+    start_epoch = 0  # 初始开始轮次
+    best_recon_loss = float("inf")  # 初始最佳损失
+    train_losses, recon_losses, kl_losses = [], [], []  # 初始损失记录
+
+    # 4. 加载检查点（如果存在，自动续训）
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"]  # 恢复上次中断的轮次
+        best_recon_loss = checkpoint["best_recon_loss"]  # 恢复最佳损失
+        train_losses = checkpoint["train_losses"]  # 恢复损失记录
+        recon_losses = checkpoint["recon_losses"]
+        kl_losses = checkpoint["kl_losses"]
+        print(f"✅ 找到检查点，从第 {start_epoch + 1} 轮继续训练！")
+    else:
+        print("🔍 未找到检查点，从头开始训练")
+
+    # 5. 早停策略（基于恢复的best_recon_loss）
+    patience = 15
     patience_counter = 0
 
-    # 4. 训练记录
-    train_losses = []
-    recon_losses = []
-    kl_losses = []
-
-    # 5. 开始训练
+    # 6. 开始训练（从start_epoch开始，而非0）
     model.train()
-    for epoch in range(EPOCHS):
+    for epoch in range(start_epoch, EPOCHS):
         epoch_total_loss = 0.0
         epoch_recon_loss = 0.0
         epoch_kl_loss = 0.0
-
-        # 修正2：KL权重暖启动（前50轮线性增长到0.1，避免初始权重为0）
+        # KL权重暖启动（轮次从恢复后开始计算，不影响）
         kl_warmup_epochs = 50
         current_kl_weight = KL_TARGET_WEIGHT * min(1.0, (epoch + 1) / kl_warmup_epochs)
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{EPOCHS}")
         for batch in pbar:
             batch = batch.to(DEVICE)
-
             # 前向传播
             recon_batch, mu, logvar = model(batch)
             total_loss, recon_loss, kl_loss = vae_loss(recon_batch, batch, mu, logvar, current_kl_weight)
-
-            # 反向传播：新增梯度裁剪，防止梯度爆炸
+            # 反向传播+梯度裁剪
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 梯度裁剪到最大范数1.0
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
             optimizer.step()
-
             # 累计损失
             epoch_total_loss += total_loss.item()
             epoch_recon_loss += recon_loss.item()
             epoch_kl_loss += kl_loss.item()
-
-            # 更新进度条（保留4位小数，避免科学计数法）
+            # 更新进度条
             pbar.set_postfix({
                 "total_loss": f"{total_loss.item():.4f}",
                 "recon_loss": f"{recon_loss.item():.4f}",
-                "kl_loss": f"{kl_loss.item():.4f}"
+                "kl_loss": f"{kl_loss.item():.4f}",
+                "kl_w": f"{current_kl_weight:.4f}"
             })
 
         # 计算本轮平均损失
         avg_total_loss = epoch_total_loss / len(dataloader)
         avg_recon_loss = epoch_recon_loss / len(dataloader)
         avg_kl_loss = epoch_kl_loss / len(dataloader)
-
         train_losses.append(avg_total_loss)
         recon_losses.append(avg_recon_loss)
         kl_losses.append(avg_kl_loss)
 
         print(
-            f"Epoch {epoch + 1} | 平均总损失：{avg_total_loss:.4f} | 平均重建损失：{avg_recon_loss:.4f} | 平均KL损失：{avg_kl_loss:.4f}")
+            f"Epoch {epoch + 1} | 平均总损失：{avg_total_loss:.4f} | 平均重建损失：{avg_recon_loss:.4f} | 平均KL损失：{avg_kl_loss:.4f}"
+        )
 
-        # 早停判断
+        # 7. 保存最新检查点（每轮都存，覆盖式，中断后用这个续训）
+        torch.save({
+            "epoch": epoch + 1,  # 保存当前完成的轮次
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_recon_loss": best_recon_loss,
+            "train_losses": train_losses,
+            "recon_losses": recon_losses,
+            "kl_losses": kl_losses
+        }, checkpoint_path)
+        print(f"💾 已保存最新检查点到：{checkpoint_path}")
+
+        # 8. 保存最佳模型（按重建损失，只存最优的）
         if avg_recon_loss < best_recon_loss:
             best_recon_loss = avg_recon_loss
             patience_counter = 0
-            # 保存最优模型
             torch.save({
                 "epoch": epoch + 1,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_recon_loss": best_recon_loss
-            }, os.path.join(MODEL_SAVE_DIR, "best_vae3d.pth"))
-            print(f"保存最优模型（重建损失：{best_recon_loss:.4f}）")
+            }, best_model_path)
+            print(f"🏆 保存最优模型（重建损失：{best_recon_loss:.4f}）到：{best_model_path}")
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"连续{patience}轮重建损失无提升，触发早停")
+                print(f"⚠️ 连续{patience}轮重建损失无提升，触发早停")
                 break
 
-    # 6. 绘制损失曲线
+    # 9. 绘制损失曲线（基于恢复+新增的损失记录）
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 3, 1)
     plt.plot(train_losses, label="Total Loss")
@@ -287,21 +310,18 @@ def train_vae():
     plt.ylabel("Loss")
     plt.title("Total Loss Curve")
     plt.legend()
-
     plt.subplot(1, 3, 2)
     plt.plot(recon_losses, label="Recon Loss", color="orange")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Reconstruction Loss Curve")
     plt.legend()
-
     plt.subplot(1, 3, 3)
     plt.plot(kl_losses, label="KL Loss", color="green")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("KL Loss Curve")
     plt.legend()
-
     plt.tight_layout()
     plt.savefig(os.path.join(MODEL_SAVE_DIR, "loss_curves.png"))
     plt.show()
