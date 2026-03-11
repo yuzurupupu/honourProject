@@ -1,7 +1,14 @@
-z = torch.randn(1,128).cuda()
+import matplotlib.pyplot as plt
 
-fake = G(z)
 
-volume = fake[0,0].cpu().numpy()
+def save_slice(volume,path):
 
-save_nii(volume,"generated.nii.gz")
+    z = volume.shape[0]//2
+
+    slice = volume[z]
+
+    plt.imshow(slice,cmap="gray")
+
+    plt.axis("off")
+
+    plt.savefig(path)
