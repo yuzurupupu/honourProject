@@ -1,0 +1,13 @@
+LATENT_DIM = 128
+
+IMAGE_SHAPE = (4,128,160,160)
+
+BATCH_SIZE = 2
+
+LR = 2e-4
+
+EPOCHS = 200
+
+LAMBDA_GP = 10
+
+DEVICE = "cuda"
