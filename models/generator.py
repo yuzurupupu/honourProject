@@ -1,36 +1,49 @@
 import torch.nn as nn
+import torch.nn.functional as F
+import torch
+
 
 class Generator(nn.Module):
-
-    def __init__(self,z_dim=128):
-
+    def __init__(self, noise=1000, channel=64):
         super().__init__()
+        c = channel
+        self.noise = noise
+        self.relu = nn.ReLU(inplace=True)
 
-        self.fc = nn.Linear(z_dim,256*8*10*10)
+        self.tp_conv1 = nn.ConvTranspose3d(noise, c * 8, kernel_size=4, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm3d(c * 8)
 
-        self.net = nn.Sequential(
+        self.tp_conv2 = nn.Conv3d(c * 8, c * 4, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm3d(c * 4)
 
-            nn.ConvTranspose3d(256,128,4,2,1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(),
+        self.tp_conv3 = nn.Conv3d(c * 4, c * 2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm3d(c * 2)
 
-            nn.ConvTranspose3d(128,64,4,2,1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(),
+        self.tp_conv4 = nn.Conv3d(c * 2, c, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm3d(c)
 
-            nn.ConvTranspose3d(64,32,4,2,1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(),
+        self.tp_conv5 = nn.Conv3d(c, 1, kernel_size=3, stride=1, padding=1, bias=False)
 
-            nn.ConvTranspose3d(32,4,4,2,1),
+    def forward(self, noise):
+        noise = noise.view(-1, self.noise, 1, 1, 1)
 
-            nn.Tanh()
-        )
+        h = self.tp_conv1(noise)
+        h = self.relu(self.bn1(h))
 
-    def forward(self,z):
+        h = F.interpolate(h, scale_factor=2, mode="nearest")
+        h = self.tp_conv2(h)
+        h = self.relu(self.bn2(h))
 
-        x = self.fc(z)
+        h = F.interpolate(h, scale_factor=2, mode="nearest")
+        h = self.tp_conv3(h)
+        h = self.relu(self.bn3(h))
 
-        x = x.view(-1,256,8,10,10)
+        h = F.interpolate(h, scale_factor=2, mode="nearest")
+        h = self.tp_conv4(h)
+        h = self.relu(self.bn4(h))
 
-        return self.net(x)
+        h = F.interpolate(h, scale_factor=2, mode="nearest")
+        h = self.tp_conv5(h)
+
+        h = torch.tanh(h)
+        return h
